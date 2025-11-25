@@ -36,25 +36,29 @@ document.addEventListener("DOMContentLoaded", () => {
   const startBtn = document.getElementById("btn-start-chat");
   const loadingTextEl = document.getElementById("loading-text");
 
-  startBtn.addEventListener("click", () => {
-    const targetScreen =
-      selectedTopic === "healthcare" ? "screen-healthcare" : "screen-education";
+  if (startBtn && loadingTextEl) {
+    startBtn.addEventListener("click", () => {
+      const targetScreen =
+        selectedTopic === "healthcare"
+          ? "screen-healthcare"
+          : "screen-education";
 
-    // set loading text based on topic
-    if (selectedTopic === "healthcare") {
-      loadingTextEl.textContent = "Scrubbing in...";
-    } else {
-      loadingTextEl.textContent = "Organising your resources...";
-    }
+      // set loading text based on topic
+      if (selectedTopic === "healthcare") {
+        loadingTextEl.textContent = "Scrubbing in...";
+      } else {
+        loadingTextEl.textContent = "Organising your resources...";
+      }
 
-    // show loading first
-    showScreen("screen-loading");
+      // show loading first
+      showScreen("screen-loading");
 
-    // fake loading delay, then jump to chat
-    setTimeout(() => {
-      showScreen(targetScreen);
-    }, 2000);
-  });
+      // fake loading delay, then jump to chat
+      setTimeout(() => {
+        showScreen(targetScreen);
+      }, 2000);
+    });
+  }
 
   // ---------- SIMPLE CHAT + HISTORY ----------
   const history = [];
@@ -106,10 +110,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function refreshHistory() {
     const list = document.getElementById("history-list");
+    if (!list) return;
+
     list.innerHTML = "";
 
     if (!history.length) {
-      list.innerHTML = `<p style="color:#7f8c8d">No chat history yet.</p>`;
+      list.innerHTML = `<p style="color:#7f8c8d">No chat history found.</p>`;
       return;
     }
 
@@ -129,8 +135,35 @@ document.addEventListener("DOMContentLoaded", () => {
 
   refreshHistory();
 
-  // ---------- SETTINGS TOGGLES ----------
-  document.querySelectorAll(".toggle").forEach((t) => {
-    t.addEventListener("click", () => t.classList.toggle("active"));
-  });
+  // ---------- DARK MODE TOGGLE (light/dark theme switch) ----------
+  const darkToggle = document.querySelector('[data-setting="darkmode"]');
+
+  if (darkToggle) {
+    // Helper to apply theme + sync toggle
+    const applyTheme = (makeLight) => {
+      if (makeLight) {
+        document.body.classList.add("light-mode");
+        darkToggle.classList.add("active");
+        localStorage.setItem("chatly-theme", "light");
+      } else {
+        document.body.classList.remove("light-mode");
+        darkToggle.classList.remove("active");
+        localStorage.setItem("chatly-theme", "dark");
+      }
+    };
+
+    // 1. Load saved theme (if any)
+    const saved = localStorage.getItem("chatly-theme");
+    if (saved === "light") {
+      applyTheme(true);
+    } else {
+      applyTheme(false); // default = dark (your current theme)
+    }
+
+    // 2. When user clicks the toggle
+    darkToggle.addEventListener("click", () => {
+      const willBeLight = !document.body.classList.contains("light-mode");
+      applyTheme(willBeLight);
+    });
+  }
 });
