@@ -38,7 +38,7 @@
             Sign In
           </button>
           <p class="auth-toggle">
-            No account? <a href="#" onclick="switchAuthForm()">Create one</a>
+            No account? <a href="#" onclick="event.preventDefault(); window.switchAuthForm();">Create one</a>
           </p>
           <div id="login-error" class="auth-error"></div>
         </div>
@@ -92,7 +92,7 @@
             Create Account
           </button>
           <p class="auth-toggle">
-            Already have an account? <a href="#" onclick="switchAuthForm()">Sign In</a>
+            Already have an account? <a href="#" onclick="event.preventDefault(); window.switchAuthForm();">Sign In</a>
           </p>
           <div id="signup-error" class="auth-error"></div>
         </div>

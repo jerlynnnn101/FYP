@@ -84,6 +84,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // ---------- SIMPLE CHAT + HISTORY ----------
   const history = [];
+  let currentUserId = null; // Track which user's data we're viewing
 
   function addMessage(chatId, sender, text) {
     const container = document.getElementById(chatId + "-messages");
@@ -95,6 +96,57 @@ document.addEventListener("DOMContentLoaded", () => {
 
     container.appendChild(msg);
     container.scrollTop = container.scrollHeight;
+  }
+
+  // Listen for user change event (from Firebase auth)
+  window.addEventListener('userChanged', (event) => {
+    const userId = event.detail.userId;
+    currentUserId = userId;
+    loadUserChatHistory(userId);
+  });
+
+  // Listen for clear chat history event (from Firebase auth - when switching users)
+  window.addEventListener('clearChatHistory', () => {
+    history.length = 0; // Clear the history array
+    refreshHistory();
+  });
+
+  // Load chat history for specific user
+  function loadUserChatHistory(userId) {
+    if (!userId) {
+      history.length = 0;
+      return;
+    }
+
+    // Load from localStorage using user ID as key
+    const savedHistory = localStorage.getItem(`chatHistory-${userId}`);
+    history.length = 0; // Clear current history
+    
+    if (savedHistory) {
+      try {
+        const parsedHistory = JSON.parse(savedHistory);
+        history.push(...parsedHistory);
+      } catch (e) {
+        console.log('Could not parse chat history');
+      }
+    }
+    
+    refreshHistory();
+    
+    // Rebuild messages on screen
+    document.getElementById('healthcare-messages').innerHTML = '<div class="message bot">Please enter your medical inquiry.</div>';
+    document.getElementById('education-messages').innerHTML = '<div class="message bot">Please enter your academic question.</div>';
+    
+    history.forEach(item => {
+      addMessage(item.topic, 'user', item.text);
+      setTimeout(() => {
+        addMessage(
+          item.topic,
+          'bot',
+          `Thanks for your question about ${item.topic}. (demo reply)`
+        );
+      }, 100);
+    });
   }
 
   document.querySelectorAll(".chat-input-row").forEach((form) => {
@@ -114,6 +166,11 @@ document.addEventListener("DOMContentLoaded", () => {
         text,
         timestamp: new Date(),
       });
+
+      // Save to localStorage with user ID key
+      if (currentUserId) {
+        localStorage.setItem(`chatHistory-${currentUserId}`, JSON.stringify(history));
+      }
 
       refreshHistory();
 
