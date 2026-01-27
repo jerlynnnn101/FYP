@@ -1,100 +1,224 @@
 import os
-import sys
-from langchain_community.document_loaders import DirectoryLoader, PDFPlumberLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter 
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_classic.chains import RetrievalQA 
-from langchain_ibm import WatsonxLLM
+import re
+from typing import Dict, List, Tuple
 
-# --- 1. IBM Watsonx.ai Credentials and Connection Setup (No Change) ---
-os.environ["WATSONX_API_KEY"] = "heqOEuyYXy-ngbBIHva-GR8-0HNBFystyN9V6Vv2oMJB"
-os.environ["IBM_PROJECT_ID"] = "0ed5949a-bd21-4f66-9733-4646506adc34"
-os.environ["WATSONX_URL"] = "https://us-south.ml.cloud.ibm.com" 
-
-if not os.getenv("WATSONX_API_KEY"):
-    print("FATAL ERROR: WATSONX_API_KEY is missing. Cannot proceed.")
-    sys.exit(1)
-
-print("✅ IBM Credentials and URL loaded.")
-
-# --- 2. RAG Application Setup (Vector Store remains the same) ---
-
-watsonx_llm = WatsonxLLM(                      
-    model_id="ibm/granite-3-8b-instruct",                   
-    project_id=os.getenv("IBM_PROJECT_ID"),
-    params={'max_new_tokens': 1024, 'temperature': 0.1} 
-)
-print("✅ WatsonxLLM initialized.")
-
-directory_path = './granite-snack-cookbook/fyp_document'
-loader = DirectoryLoader(
-    path=directory_path, 
-    loader_cls=PDFPlumberLoader, 
-    glob='*.pdf'             
-)
-
+# Optional PDF support
 try:
-    documents = loader.load()
-except Exception as e:
-    print(f"FATAL ERROR: Failed to load documents from {directory_path}. Error: {e}")
-    sys.exit(1)
+    import PyPDF2
+except Exception:
+    PyPDF2 = None
 
-text_splitter = RecursiveCharacterTextSplitter( 
-    chunk_size=300,        
-    chunk_overlap=150     
-)
-docs = text_splitter.split_documents(documents)
-print(f"✅ Documents split into {len(docs)} chunks.")
 
-# The HuggingFaceEmbeddings model is powerful, but we need to tune retrieval.
-embeddings = HuggingFaceEmbeddings(
-    model_name="all-MiniLM-L6-v2" 
-)
+# -----------------------------
+# Local in-memory index
+# -----------------------------
+LOCAL_INDEX: Dict[str, List[Dict]] = {}
+# Structure:
+# LOCAL_INDEX[user_id] = [
+#   {"source": "filename#chunk3", "sentences": [...], "tokens": set([...])}
+# ]
 
-db = FAISS.from_documents(docs, embeddings) 
-print("✅ FAISS Vector Index created.")
 
-# --- 3. Create the RetrievalQA Chain (CRITICAL TWEAK HERE) ---
-# We are changing the search type and reducing the number of documents passed to the LLM.
+# -----------------------------
+# Text cleaning & utilities
+# -----------------------------
+def _clean_text(text: str) -> str:
+    text = text.replace("\x00", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=watsonx_llm,        
-    chain_type="stuff",        
-    # 🌟 CRITICAL TWEAK: Set search_type to 'mmr' and k=3 to prioritize the most relevant unique chunks.
-    retriever=db.as_retriever(search_type="mmr", search_kwargs={'k': 3}), 
-    return_source_documents=True 
-)       
 
-print("--- OPTIMIZED RAG Setup Complete. Ready to query. ---")
+def _remove_pdf_noise(line: str) -> bool:
+    """Return True if line looks like PDF junk."""
+    line = line.strip().lower()
+    if not line:
+        return True
+    if re.match(r"^\d+$", line):
+        return True
+    if "contents" in line or "foreword" in line:
+        return True
+    if len(line.split()) < 5:
+        return True
+    return False
 
-# --- 4. Your Original Question Cell (Execution) ---
 
-if qa_chain:
-    question = "What are the ISBN and DOI for the paperback version of the STEM Education report?"
+def _split_sentences(text: str) -> List[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    cleaned = []
+    for s in sentences:
+        s = s.strip()
+        if _remove_pdf_noise(s):
+            continue
+        if not re.match(r"^[A-Z]", s):
+            continue
+        cleaned.append(s)
+    return cleaned
 
-    print(f"\n--- Running Query: {question} ---")
 
+def _tokenize(text: str) -> set:
+    return set(re.findall(r"[a-z0-9']+", text.lower()))
+
+
+def _chunk_text(text: str, max_sentences: int = 5) -> List[List[str]]:
+    sentences = _split_sentences(text)
+    chunks = []
+    buf = []
+
+    for s in sentences:
+        buf.append(s)
+        if len(buf) >= max_sentences:
+            chunks.append(buf)
+            buf = []
+
+    if buf:
+        chunks.append(buf)
+
+    return chunks
+
+
+# -----------------------------
+# File reading
+# -----------------------------
+def _read_txt_or_md(filepath: str) -> str:
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def _read_pdf(filepath: str) -> str:
+    if PyPDF2 is None:
+        raise RuntimeError("PyPDF2 is not installed. Install it to read PDFs.")
+    text_parts = []
+    with open(filepath, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
+            text_parts.append(page.extract_text() or "")
+    return "\n".join(text_parts)
+
+
+def _read_docx(filepath: str) -> str:
     try:
-        result_dict = qa_chain.invoke({'query': question})
+        from docx import Document
+        doc = Document(filepath)
+        text_parts = []
+        for para in doc.paragraphs:
+            text_parts.append(para.text)
+        return "\n".join(text_parts)
+    except Exception:
+        return ""
 
-        answer = result_dict['result']
-        sources = result_dict['source_documents']
 
-        print("\n--------------------------------------------------------------------------------")
-        print(f"Question: {question}")
-        print("---")
-        print(f"Answer: {answer}")
+# -----------------------------
+# Ingestion
+# -----------------------------
+def ingest_local_document(user_id: str, filepath: str) -> None:
+    ext = os.path.splitext(filepath)[1].lower()
+    filename = os.path.basename(filepath)
 
-        # --- CITATION SECTION ---
-        print("\n--- Sources Used (for Citation) ---")
-        for doc in sources:
-            source_file = doc.metadata.get('source', 'N/A').split('/')[-1]
-            page_number = doc.metadata.get('page', 'N/A')
-            print(f"File: {source_file} (Page: {page_number})")
-            
-    except Exception as e:
-        print(f"\nQUERY FAILED during execution. Error details: {e}")
+    if ext in [".txt", ".md"]:
+        raw = _read_txt_or_md(filepath)
+    elif ext == ".pdf":
+        raw = _read_pdf(filepath)
+    elif ext == ".docx":
+        raw = _read_docx(filepath)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
 
-else:
-    print("\nQuery cannot be executed because the RAG chain failed to initialize.")
+    raw = _clean_text(raw)
+    sentence_chunks = _chunk_text(raw)
+
+    items = []
+    for i, sentences in enumerate(sentence_chunks):
+        text_block = " ".join(sentences)
+        items.append({
+            "source": f"{filename}#chunk{i+1}",
+            "sentences": sentences,
+            "tokens": _tokenize(text_block)
+        })
+
+    LOCAL_INDEX.setdefault(user_id, [])
+    LOCAL_INDEX[user_id].extend(items)
+
+
+# -----------------------------
+# Retrieval
+# -----------------------------
+def _retrieve_local(query: str, user_id: str, top_k: int = 5) -> List[Tuple[float, Dict]]:
+    q_tokens = _tokenize(query)
+    candidates = LOCAL_INDEX.get(user_id, []) + LOCAL_INDEX.get("guest", [])
+
+    scored = []
+    for item in candidates:
+        overlap = len(q_tokens & item["tokens"])
+        score = overlap / max(len(q_tokens), 1)
+        if score > 0:
+            scored.append((score, item))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:top_k]
+
+
+# -----------------------------
+# Confidence
+# -----------------------------
+def _confidence_from_results(scores: List[float]) -> Dict:
+    if not scores:
+        return {"score": 0.0, "label": "Low"}
+
+    avg = sum(scores) / len(scores)
+
+    if avg >= 0.75:
+        label = "High"
+    elif avg >= 0.4:
+        label = "Medium"
+    else:
+        label = "Low"
+
+    return {"score": round(avg, 2), "label": label}
+
+
+# -----------------------------
+# Main RAG
+# -----------------------------
+def run_rag_query(query: str, user_id: str) -> Dict:
+    # Check if user has any uploaded documents
+    user_docs = LOCAL_INDEX.get(user_id, []) + LOCAL_INDEX.get("guest", [])
+    if not user_docs:
+        return {
+            "answer": "Please upload a document first, then ask your questions.",
+            "confidence": {"score": 0.0, "label": "Low"},
+            "sources": [],
+        }
+
+    results = _retrieve_local(query, user_id=user_id, top_k=5)
+
+    if not results:
+        return {
+            "answer": "I couldn’t find relevant information in the uploaded documents.",
+            "confidence": {"score": 0.0, "label": "Low"},
+            "sources": [],
+        }
+
+    scores = []
+    collected_sentences = []
+    sources = []
+
+    for score, item in results:
+        scores.append(score)
+        sources.append(item["source"])
+        for s in item["sentences"]:
+            if s not in collected_sentences:
+                collected_sentences.append(s)
+
+    # Keep answer focused (no dumping)
+    final_sentences = collected_sentences[:6]
+
+    answer = (
+        "Based on the uploaded document content, here is a summary answer:\n\n"
+        + " ".join(final_sentences)
+    )
+
+    return {
+        "answer": answer,
+        "confidence": _confidence_from_results(scores),
+        "sources": sources,
+    }
