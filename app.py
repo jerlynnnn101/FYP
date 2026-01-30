@@ -1,14 +1,10 @@
 import os
-import json
 import sqlite3
-import mimetypes
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
-from google.cloud import storage
-from google.oauth2 import service_account
 
 # RAG engine
 from FYP_RAG.rag_query_ibm import run_rag_query, ingest_local_document
@@ -44,45 +40,6 @@ def init_db():
         """)
 
 # -----------------------------
-# Cloud Storage (Firebase/GCS)
-# -----------------------------
-def _get_gcs_client():
-    """Create a Google Cloud Storage client.
-    Prefer credentials from GCP_SERVICE_ACCOUNT_JSON env if provided; otherwise default.
-    """
-    try:
-        creds_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
-        if creds_json:
-            credentials = service_account.Credentials.from_service_account_info(json.loads(creds_json))
-            return storage.Client(credentials=credentials)
-        # Fallback to default credentials (will work locally if configured)
-        return storage.Client()
-    except Exception:
-        return None
-
-def upload_to_gcs(user_id: str, local_path: str, filename: str):
-    """Upload a local file to GCS under uploads/{user_id}/{filename}.
-    Returns the gs:// URI on success, else None.
-    """
-    bucket_name = os.environ.get("GCS_BUCKET_NAME")
-    if not bucket_name:
-        return None
-    client = _get_gcs_client()
-    if client is None:
-        return None
-    try:
-        bucket = client.bucket(bucket_name)
-        blob_path = f"uploads/{user_id}/{filename}"
-        blob = bucket.blob(blob_path)
-        blob.upload_from_filename(local_path)
-        blob.content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-        blob.patch()
-        return f"gs://{bucket_name}/{blob_path}"
-    except Exception as e:
-        app.logger.exception("GCS upload failed")
-        return None
-
-# -----------------------------
 # Routes
 # -----------------------------
 @app.route("/")
@@ -107,15 +64,11 @@ def upload_docs():
     path = os.path.join(user_dir, filename)
     file.save(path)
 
-    # Optional: Upload to cloud storage for persistence on Heroku
-    cloud_uri = upload_to_gcs(user_id, path, filename)
-
     try:
         ingest_local_document(user_id, path)
         return jsonify(
             success=True,
-            message="Successfully uploaded document",
-            cloud_uri=cloud_uri
+            message="Successfully uploaded document"
         )
     except Exception as e:
         app.logger.exception("Upload / ingest failed")
