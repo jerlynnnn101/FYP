@@ -1,10 +1,10 @@
-# .render.yaml for deploying Flask app with Gunicorn
 services:
   - type: web
     name: fyp-flask-app
     env: python
     buildCommand: "pip install -r requirements.txt"
     startCommand: "gunicorn app:app"
+    pythonVersion: 3.11
     envVars:
       - key: FLASK_ENV
         value: production
