@@ -4,9 +4,17 @@ python-dotenv==1.0.0
 pypdf2==3.0.1
 requests==2.32.2
 werkzeug==2.3.7
+
 langchain==0.2.14
 langchain-community==0.2.12
 chromadb==0.5.3
 docling==2.70.0
+
 ibm-watsonx-ai==1.0.5
 sentence-transformers==2.6.1
+
+
+gunicorn
+pandas>=2.2.2
+numpy>=1.26
+pyarrow>=15.0.0
