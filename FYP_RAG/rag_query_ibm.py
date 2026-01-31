@@ -1,3 +1,74 @@
+# -----------------------------
+# DOCX ingestion (python-docx fallback)
+# -----------------------------
+def ingest_docx_document(user_id: str, filepath: str):
+    """
+    Ingest a DOCX file using python-docx (no Docling dependency).
+    Extracts paragraphs, chunks them, and stores in LOCAL_INDEX and Chroma.
+    """
+    import os
+    import re
+    import hashlib
+    from docx import Document
+    filename = os.path.basename(filepath)
+    chunks = []
+    try:
+        # Compute a short hash of the file content for unique chunk IDs
+        with open(filepath, "rb") as f:
+            file_bytes = f.read()
+        file_hash = hashlib.sha1(file_bytes).hexdigest()[:8]
+        doc = Document(filepath)
+        paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        full_text = " ".join(paragraphs)
+        sentences = re.split(r"(?<=[.!?])\s+", full_text)
+        title = None
+        for p in paragraphs:
+            if 5 <= len(p) <= 160:
+                title = p
+                break
+        if not title and sentences:
+            first_line = sentences[0].strip()
+            if 5 <= len(first_line) <= 160:
+                title = first_line
+        meta = DOC_META.setdefault(user_id, {}).setdefault(filename, {})
+        meta["title"] = title or ""
+        for i in range(0, len(sentences), 4):
+            block = " ".join(sentences[i:i+4]).strip()
+            if not block:
+                continue
+            page_num = (i // 40) + 1
+            chunks.append({
+                "source": filename,
+                "page": page_num,
+                "chunk": ((i % 40) // 4) + 1,
+                "text": block,
+                "tokens": tokenize(block),
+            })
+        LOCAL_INDEX.setdefault(user_id, []).extend(chunks)
+        try:
+            col = get_chroma_collection(user_id)
+            ids = []
+            docs = []
+            metas = []
+            for c in chunks:
+                # Add file_hash to chunk ID for uniqueness
+                ids.append(f"{filename}_{file_hash}_p{c['page']}_c{c['chunk']}")
+                docs.append(c["text"])
+                metas.append({"source": filename, "page": c["page"], "chunk": c["chunk"]})
+            # Delete any existing embeddings with these IDs before adding
+            if ids:
+                try:
+                    col.delete(ids=ids)
+                except Exception as del_e:
+                    print(f"⚠️ Chroma delete failed for DOCX IDs: {del_e}")
+            if docs:
+                col.add(ids=ids, documents=docs, metadatas=metas)
+        except Exception as e:
+            print("⚠️ Chroma ingest failed for DOCX (LOCAL_INDEX only):", e)
+    except Exception as e:
+        print(f"❌ Failed to ingest DOCX: {filepath} — {e}")
+        raise
+    
 import os
 import math
 import re
@@ -23,6 +94,8 @@ print("✅ WATSONX_URL:", os.getenv("WATSONX_URL"))
 
 # In-memory index: user_id -> chunks
 LOCAL_INDEX: Dict[str, List[dict]] = {}
+# Document-level metadata cache: user_id -> filename -> {title: str | None}
+DOC_META: Dict[str, Dict[str, Dict[str, str]]] = {}
 STOPWORDS = {
     "the","a","an","and","or","but","if","then","than","that","this","those","these",
     "is","are","was","were","be","been","being","of","in","on","for","to","with","without",
@@ -75,6 +148,40 @@ def ingest_local_document(user_id: str, filepath: str):
 
     with open(filepath, "rb") as f:
         reader = PyPDF2.PdfReader(f)
+        # Extract title/author/date from PDF metadata or first page
+        title = None
+        author = None
+        pubdate = None
+        try:
+            info = getattr(reader, "metadata", None) or getattr(reader, "documentInfo", None)
+            if info:
+                t = getattr(info, "title", None) or info.get("/Title") if hasattr(info, "get") else None
+                if t and isinstance(t, str) and len(t.strip()) >= 5:
+                    title = t.strip()
+                a = getattr(info, "author", None) or info.get("/Author") if hasattr(info, "get") else None
+                if a and isinstance(a, str) and len(a.strip()) >= 2:
+                    author = a.strip()
+                # PDF dates often look like D:YYYYMMDDHHmmSSZ
+                d = getattr(info, "creation_date", None) or info.get("/CreationDate") if hasattr(info, "get") else None
+                d = d or (getattr(info, "mod_date", None) or info.get("/ModDate") if hasattr(info, "get") else None)
+                if d and isinstance(d, str):
+                    pubdate = _parse_pdf_date(d)
+        except Exception:
+            pass
+        if title is None:
+            try:
+                first_text = clean_text(reader.pages[0].extract_text() or "") if reader.pages else ""
+                first_line = re.split(r"\n|\r|(?<=[.!?])\s+", first_text)[0].strip()
+                if 5 <= len(first_line) <= 160:
+                    title = first_line
+            except Exception:
+                pass
+        meta = DOC_META.setdefault(user_id, {}).setdefault(filename, {})
+        meta["title"] = title or ""
+        if author:
+            meta["author"] = author
+        if pubdate:
+            meta["date"] = pubdate
         for page_num, page in enumerate(reader.pages, start=1):
             text = clean_text(page.extract_text() or "")
             if not text:
@@ -112,69 +219,140 @@ def ingest_local_document(user_id: str, filepath: str):
         print("⚠️ Chroma ingest failed (falling back to LOCAL_INDEX only):", e)
 
 
+
+
 # -----------------------------
 # Docling ingestion (best-effort)
 # -----------------------------
 def ingest_document_docling(user_id: str, filepath: str):
     """
-    Prefer Docling for robust parsing + chunking if available;
+    Prefer Docling + LangChain cookbook pipeline if available;
     fallback to PyPDF2-based ingestion otherwise.
     """
-    if docling is None:
-        print("ℹ️ Docling not available, using PyPDF2 ingestion.")
-        return ingest_local_document(user_id, filepath)
-
-    filename = os.path.basename(filepath)
-    chunks = []
     try:
-        # Docling API varies; attempt generic pipeline and fallback on error
-        # Use docling.parse to extract text segments, if supported
-        from docling_parse import Parser  # type: ignore
-        parser = Parser()
-        doc = parser.parse(filepath)
-        texts = []
-        try:
-            # Collect paragraphs or segments (best-effort)
-            texts = [seg.text for seg in getattr(doc, "segments", []) if getattr(seg, "text", "")]  # type: ignore
-        except Exception:
-            pass
-        if not texts:
-            # Fallback: use PyPDF2 path
-            print("ℹ️ Docling parse returned no segments, falling back to PyPDF2.")
+        ext = os.path.splitext(filepath)[-1].lower().strip('.')
+        if docling is None:
+            # If not PDF, we cannot parse without Docling
+            if ext != "pdf":
+                raise RuntimeError("Docling not available for non-PDF formats (DOCX/PPTX).")
+            # For PDF, fallback to PyPDF2 ingestion
             return ingest_local_document(user_id, filepath)
 
-        # Group texts into blocks of ~4 segments
-        for i in range(0, len(texts), 4):
-            block = clean_text(" ".join(texts[i:i+4]))
-            if not block:
+        # Attempt cookbook pipeline imports inside try
+        from langchain_community.document_loaders import DoclingLoader  # type: ignore
+        from docling.document_converter import DocumentConverter  # type: ignore
+        from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore
+        from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+        from langchain_community.vectorstores import Chroma  # type: ignore
+
+        converter = DocumentConverter()
+        loader = DoclingLoader([filepath], converter=converter)
+        documents = loader.load()
+
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+        )
+        splits = text_splitter.split_documents(documents)
+
+        model_name = os.getenv("SENTENCE_TRANSFORMER_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+        embeddings = HuggingFaceEmbeddings(model_name=model_name)
+
+        # Normalize metadata to ensure consistent filtering by filename
+        filename = os.path.basename(filepath)
+        # Try to populate document-level title/author/date
+        doc_title = None
+        doc_author = None
+        doc_date = None
+        try:
+            # Some loaders include title in metadata
+            for d in documents:
+                if hasattr(d, "metadata") and d.metadata:
+                    dt = d.metadata.get("title") or d.metadata.get("document_title")
+                    if dt and isinstance(dt, str) and len(dt.strip()) >= 5:
+                        doc_title = dt.strip()
+                    da = d.metadata.get("author") or d.metadata.get("authors")
+                    if da and isinstance(da, str) and len(da.strip()) >= 2:
+                        doc_author = da.strip()
+                    dd = d.metadata.get("date") or d.metadata.get("publication_date") or d.metadata.get("created")
+                    if dd and isinstance(dd, str) and len(dd.strip()) >= 4:
+                        doc_date = dd.strip()
+        except Exception:
+            pass
+        if doc_title is None:
+            # Fallback to PDF inspection like local ingest
+            try:
+                with open(filepath, "rb") as _f:
+                    r2 = PyPDF2.PdfReader(_f)
+                    info = getattr(r2, "metadata", None) or getattr(r2, "documentInfo", None)
+                    if info:
+                        t = getattr(info, "title", None) or info.get("/Title") if hasattr(info, "get") else None
+                        if t and isinstance(t, str) and len(t.strip()) >= 5:
+                            doc_title = t.strip()
+                        a = getattr(info, "author", None) or info.get("/Author") if hasattr(info, "get") else None
+                        if a and isinstance(a, str) and len(a.strip()) >= 2:
+                            doc_author = a.strip()
+                        d = getattr(info, "creation_date", None) or info.get("/CreationDate") if hasattr(info, "get") else None
+                        d = d or (getattr(info, "mod_date", None) or info.get("/ModDate") if hasattr(info, "get") else None)
+                        if d and isinstance(d, str):
+                            parsed = _parse_pdf_date(d)
+                            if parsed:
+                                doc_date = parsed
+                    if doc_title is None and r2.pages:
+                        first_text = clean_text(r2.pages[0].extract_text() or "")
+                        first_line = re.split(r"\n|\r|(?<=[.!?])\s+", first_text)[0].strip()
+                        if 5 <= len(first_line) <= 160:
+                            doc_title = first_line
+            except Exception:
+                pass
+        meta2 = DOC_META.setdefault(user_id, {}).setdefault(filename, {})
+        meta2["title"] = doc_title or ""
+        if doc_author:
+            meta2["author"] = doc_author
+        if doc_date:
+            meta2["date"] = doc_date
+        try:
+            for d in splits:
+                if not hasattr(d, "metadata") or d.metadata is None:
+                    d.metadata = {}
+                d.metadata["source"] = filename
+                if "page" not in d.metadata:
+                    d.metadata["page"] = d.metadata.get("page", 0)
+        except Exception as _:
+            pass
+
+        # Persist to the same directory and collection naming used elsewhere
+        vectorstore = Chroma.from_documents(
+            splits,
+            embeddings,
+            collection_name=f"user_{user_id}",
+            persist_directory=_get_vectorstore_path(),
+        )
+        try:
+            vectorstore.persist()
+        except Exception:
+            pass
+
+        # Also keep LOCAL_INDEX for fallback logic
+        for i, d in enumerate(splits, start=1):
+            text = clean_text(getattr(d, "page_content", ""))
+            if not text:
                 continue
-            chunks.append({
+            LOCAL_INDEX.setdefault(user_id, []).append({
                 "source": filename,
-                "page": 0,
-                "chunk": (i // 4) + 1,
-                "text": block,
-                "tokens": tokenize(block),
+                "page": d.metadata.get("page", 0) if hasattr(d, "metadata") else 0,
+                "chunk": i,
+                "text": text,
+                "tokens": tokenize(text),
             })
     except Exception as e:
-        print("⚠️ Docling ingestion failed, using PyPDF2:", e)
-        return ingest_local_document(user_id, filepath)
+        # If PDF, we can fallback; else bubble up for graceful error
+        if os.path.splitext(filepath)[-1].lower() == ".pdf":
+            print("ℹ️ Cookbook ingestion unavailable, falling back to PyPDF2:", e)
+            return ingest_local_document(user_id, filepath)
+        raise
 
-    LOCAL_INDEX.setdefault(user_id, []).extend(chunks)
-
-    # Sync into Chroma
-    try:
-        col = get_chroma_collection(user_id)
-        ids = []
-        docs = []
-        metas = []
-        for c in chunks:
-            ids.append(f"{filename}_p{c['page']}_c{c['chunk']}")
-            docs.append(c["text"])
-            metas.append({"source": filename, "page": c["page"], "chunk": c["chunk"]})
-        if docs:
-            col.add(ids=ids, documents=docs, metadatas=metas)
-    except Exception as e:
-        print("⚠️ Chroma ingest failed (Docling path):", e)
 
 
 # -----------------------------
@@ -312,8 +490,8 @@ def grounding_gate(answer: str, context: str, query: str) -> bool:
         return True
 
     unknown = a_tokens - allowed
-    # Simpler grounding: allow small amount of connective wording
-    return (len(unknown) / max(len(a_tokens), 1)) <= 0.30
+    # Stricter grounding: allow only 10% unknown tokens
+    return (len(unknown) / max(len(a_tokens), 1)) <= 0.10
 
 
 # -----------------------------
@@ -525,9 +703,220 @@ def extract_definition_from_docs(query: str, top, q_tokens):
 
 
 # -----------------------------
+# Title query handling
+# -----------------------------
+def is_title_query(query: str) -> bool:
+    q = query.lower().strip()
+    return ("title" in q) and ("document" in q or "report" in q or "paper" in q or "pdf" in q)
+
+
+def get_title_from_meta(user_id: str, source: str | None) -> str | None:
+    if not source:
+        return None
+    return (DOC_META.get(user_id, {}).get(source, {}) or {}).get("title") or None
+
+
+def is_author_query(query: str) -> bool:
+    q = query.lower().strip()
+    return ("author" in q or "written by" in q) and ("document" in q or "report" in q or "paper" in q or "pdf" in q)
+
+
+def get_author_from_meta(user_id: str, source: str | None) -> str | None:
+    if not source:
+        return None
+    return (DOC_META.get(user_id, {}).get(source, {}) or {}).get("author") or None
+
+
+def is_pubdate_query(query: str) -> bool:
+    q = query.lower().strip()
+    return ("publication date" in q or "published" in q or "date" in q) and ("document" in q or "report" in q or "paper" in q or "pdf" in q)
+
+
+def get_pubdate_from_meta(user_id: str, source: str | None) -> str | None:
+    if not source:
+        return None
+    return (DOC_META.get(user_id, {}).get(source, {}) or {}).get("date") or None
+
+
+def _parse_pdf_date(s: str) -> str | None:
+    try:
+        # PDF date format e.g., D:YYYYMMDDHHmmSSZ or with timezone offsets
+        m = re.match(r"^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([+-Z].*)?$", s)
+        if not m:
+            # Try plain year or ISO-like
+            y = re.match(r"^(\d{4})", s)
+            return y.group(1) if y else s[:16]
+        y, mo, d, hh, mm, ss = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6)
+        parts = []
+        if y:
+            parts.append(y)
+        if mo:
+            parts.append(mo)
+        if d:
+            parts.append(d)
+        date_str = "-".join(parts)
+        return date_str or y
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Summary handling
+# -----------------------------
+def is_summary_query(query: str) -> bool:
+    q = query.lower().strip()
+    return (
+        "summary" in q
+        or "summarize" in q
+        or "key findings" in q
+        or "overview" in q
+        or "abstract" in q
+    )
+
+
+def extract_summary_from_doc(user_id: str, source: str | None) -> str | None:
+    if not source:
+        return None
+    # Prefer first page content; else take top tokens from entire doc.
+    doc_chunks = [d for d in LOCAL_INDEX.get(user_id, []) if d.get("source") == source]
+    if not doc_chunks:
+        return None
+    first_page = min((d.get("page", 0) for d in doc_chunks if isinstance(d.get("page", 0), int)), default=0)
+    fp_chunks = [d for d in doc_chunks if d.get("page", 0) == first_page]
+    base_text = " ".join(clean_text(d.get("text", "")) for d in fp_chunks).strip()
+    if not base_text:
+        # Fallback: take first few chunks overall
+        doc_chunks.sort(key=lambda x: (x.get("page", 0), x.get("chunk", 0)))
+        base_text = " ".join(clean_text(d.get("text", "")) for d in doc_chunks[:5]).strip()
+    if not base_text:
+        return None
+    # Keep a concise 3-5 sentence summary by truncation.
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", base_text) if s.strip()]
+    if not sentences:
+        return None
+    return " ".join(sentences[:5])
+
+
+# -----------------------------
 # RAG query (MAIN)
 # -----------------------------
-def run_rag_query(query: str, user_id: str):
+def run_rag_query(query: str, user_id: str, restrict_source: str | None = None):
+    # If asking for document title, use metadata-based extraction
+    if is_title_query(query):
+        title = get_title_from_meta(user_id, restrict_source)
+        if title:
+            src_label = f"{restrict_source} — Page 1" if restrict_source else (restrict_source or "")
+            return {
+                "answer": title,
+                "confidence": "High",
+                "sources": [s for s in [src_label] if s],
+                "retrieval": "doc-metadata",
+            }
+    # Author
+    if is_author_query(query):
+        author = get_author_from_meta(user_id, restrict_source)
+        if author:
+            src_label = f"{restrict_source} — Metadata" if restrict_source else (restrict_source or "")
+            return {
+                "answer": author,
+                "confidence": "High",
+                "sources": [s for s in [src_label] if s],
+                "retrieval": "doc-metadata",
+            }
+    # Publication date
+    if is_pubdate_query(query):
+        pubdate = get_pubdate_from_meta(user_id, restrict_source)
+        if pubdate:
+            src_label = f"{restrict_source} — Metadata" if restrict_source else (restrict_source or "")
+            return {
+                "answer": pubdate,
+                "confidence": "High",
+                "sources": [s for s in [src_label] if s],
+                "retrieval": "doc-metadata",
+            }
+    # Document summary
+    if is_summary_query(query):
+        summary = extract_summary_from_doc(user_id, restrict_source)
+        if summary:
+            src_label = f"{restrict_source} — Page 1" if restrict_source else (restrict_source or "")
+            return {
+                "answer": summary,
+                "confidence": "High",
+                "sources": [s for s in [src_label] if s],
+                "retrieval": "doc-extractive",
+            }
+    # Optional: try Granite Snack Cookbook pattern via LangChain
+    try:
+        if (os.getenv("RAG_PIPELINE_MODE", "fallback").strip().lower() == "cookbook"):
+            from langchain.chains import RetrievalQA  # type: ignore
+            from langchain.prompts import PromptTemplate  # type: ignore
+            from langchain_community.llms import IBMWatsonxAI  # type: ignore
+            from langchain_community.vectorstores import Chroma  # type: ignore
+            from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+
+            # Load existing persistent vectorstore for this user
+            model_name = os.getenv("SENTENCE_TRANSFORMER_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+            embeddings = HuggingFaceEmbeddings(model_name=model_name)
+            vectorstore = Chroma(
+                collection_name=f"user_{user_id}",
+                embedding_function=embeddings,
+                persist_directory=_get_vectorstore_path(),
+            )
+
+            granite_llm = IBMWatsonxAI(
+                url=os.getenv("WATSONX_URL"),
+                apikey=os.getenv("WATSONX_API_KEY"),
+                project_id=os.getenv("IBM_PROJECT_ID"),
+                model_id=os.getenv("GRANITE_MODEL_ID", "ibm/granite-3-8b-instruct"),
+                params={
+                    "temperature": 0.1,
+                    "max_new_tokens": 512,
+                    "repetition_penalty": 1.1,
+                },
+            )
+
+            prompt_template = (
+                "Use the following context to answer the question. "
+                "If you cannot find the answer in the context, say \"Insufficient information in provided context.\"\n\n"
+                "Context: {context}\n\nQuestion: {question}\n\nAnswer: "
+            )
+            PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+
+            # Support source restriction via Chroma filter
+            search_kwargs = {"k": 4}
+            if restrict_source:
+                search_kwargs["filter"] = {"source": restrict_source}
+
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=granite_llm,
+                chain_type="stuff",
+                retriever=vectorstore.as_retriever(search_kwargs=search_kwargs),
+                chain_type_kwargs={"prompt": PROMPT},
+                return_source_documents=True,
+            )
+
+            result = qa_chain({"query": query})
+            answer = result.get("result", "")
+            sources_docs = result.get("source_documents", [])
+            sources_list = []
+            for d in sources_docs[:3]:
+                src = d.metadata.get("source") if hasattr(d, "metadata") else None
+                page = d.metadata.get("page") if hasattr(d, "metadata") else None
+                if src is None:
+                    continue
+                label = f"{src} — Page {page}" if page is not None else src
+                if label not in sources_list:
+                    sources_list.append(label)
+            conf = "High" if len(sources_docs) >= 3 else ("Medium" if len(sources_docs) >= 1 else "Low")
+            return {
+                "answer": answer or "Insufficient information in provided context.",
+                "confidence": f"{conf}",
+                "sources": sources_list,
+                "retrieval": "langchain-retrievalqa",
+            }
+    except Exception as e:
+        print("ℹ️ LangChain cookbook path unavailable, using fallback:", e)
+
     q_tokens = tokenize(query)
 
     top = []
@@ -538,7 +927,13 @@ def run_rag_query(query: str, user_id: str):
     token_best = 0.0
     try:
         col = get_chroma_collection(user_id)
-        results = col.query(query_texts=[query], n_results=5, include=["documents", "metadatas", "distances"])
+        where = {"source": restrict_source} if restrict_source else None
+        results = col.query(
+            query_texts=[query],
+            n_results=4,
+            include=["documents", "metadatas", "distances"],
+            where=where,
+        )
         docs = results.get("documents", [[]])[0]
         metas = results.get("metadatas", [[]])[0]
         dists = results.get("distances", [[]])[0]
@@ -555,6 +950,8 @@ def run_rag_query(query: str, user_id: str):
         print("⚠️ Chroma query failed, falling back to token overlap:", e)
         # Fallback: token overlap over LOCAL_INDEX
         docs = LOCAL_INDEX.get(user_id, [])
+        if restrict_source:
+            docs = [d for d in docs if d.get("source") == restrict_source]
         scored = []
         for d in docs:
             score = len(q_tokens & d["tokens"]) / max(len(q_tokens), 1)
@@ -581,8 +978,17 @@ def run_rag_query(query: str, user_id: str):
         print("⚠️ Granite failed, using fallback:", e)
         answer = extractive_fallback(top, q_tokens)
 
-    # Grounding: if insufficient or ungrounded, use extractive fallback
-    if answer.strip().lower() == "insufficient information in provided context." or not grounding_gate(answer, context, query):
+    # If answer is generic/hallucinated, or not grounded, fallback to extractive
+    hallucination_phrases = [
+        "based on the document", "as stated above", "according to the document", "as mentioned earlier",
+        "the document states", "the document mentions", "as per the document", "as described above"
+    ]
+    is_hallucinated = any(p in answer.lower() for p in hallucination_phrases)
+    if (
+        answer.strip().lower() == "insufficient information in provided context."
+        or not grounding_gate(answer, context, query)
+        or is_hallucinated
+    ):
         answer = extractive_fallback(top, q_tokens)
 
     avg = sum(s for s, _ in top) / len(top)

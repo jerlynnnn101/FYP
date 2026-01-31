@@ -21,5 +21,10 @@ database.db
 # OS
 .DS_Store
 
+# Test and utility scripts (should not be pushed to git)
+FYP_RAG/test_rag_chroma.py
+FYP_RAG/test_rag_strict.py
+FYP_RAG/check_watsonx_embeddings.py
+
 granite-snack-cookbook/
 

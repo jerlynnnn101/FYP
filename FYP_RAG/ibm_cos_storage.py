@@ -21,9 +21,10 @@ def cos_enabled() -> bool:
 def _get_client():
     if not ibm_boto3 or not Config:
         raise RuntimeError("ibm-cos-sdk not available; install ibm-cos-sdk or ibm-watsonx-ai")
-    endpoint = os.getenv("COS_ENDPOINT", "https://s3.us-south.cloud-object-storage.appdomain.cloud")
-    access_key = os.getenv("COS_ACCESS_KEY_ID")
-    secret_key = os.getenv("COS_SECRET_ACCESS_KEY")
+    # Sanitize values to avoid quoted env entries
+    endpoint = (os.getenv("COS_ENDPOINT", "https://s3.us-south.cloud-object-storage.appdomain.cloud") or "").strip().strip('"').strip("'")
+    access_key = (os.getenv("COS_ACCESS_KEY_ID") or "").strip().strip('"').strip("'")
+    secret_key = (os.getenv("COS_SECRET_ACCESS_KEY") or "").strip().strip('"').strip("'")
     if not (access_key and secret_key):
         raise RuntimeError("Missing COS_ACCESS_KEY_ID or COS_SECRET_ACCESS_KEY")
     return ibm_boto3.client(

@@ -21,12 +21,12 @@ CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB cap
 
 # Allowed file types for ingestion
-ALLOWED_EXTENSIONS = {"pdf", "docx", "pptx"}
+ALLOWED_EXTENSIONS = {"pdf", "docx"}
 
 # -----------------------------
 # RAG engine
 # -----------------------------
-from FYP_RAG.rag_query_ibm import run_rag_query, ingest_document_docling, ingest_local_document
+from FYP_RAG.rag_query_ibm import run_rag_query, ingest_document_docling, ingest_local_document, ingest_docx_document
 from FYP_RAG.ibm_cos_storage import cos_enabled, upload_file_to_cos
 
 # -----------------------------
@@ -65,6 +65,25 @@ def init_db():
             )
         """)
 
+def get_last_ingested_filename(user_id: str):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """
+                SELECT ref FROM perf_logs
+                WHERE user_id = ? AND kind = 'ingest' AND success = 1
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            if row:
+                return row["ref"]
+    except Exception:
+        pass
+    return None
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -84,7 +103,7 @@ def upload_docs():
     filename = secure_filename(file.filename)
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     if ext not in ALLOWED_EXTENSIONS:
-        return jsonify(success=False, message="Unsupported file type. Allowed: PDF, DOCX, PPTX"), 400
+        return jsonify(success=False, message="Unsupported file type. Allowed: PDF, DOCX"), 400
     user_dir = os.path.join(UPLOAD_FOLDER, user_id)
     os.makedirs(user_dir, exist_ok=True)
 
@@ -93,8 +112,11 @@ def upload_docs():
     file.save(path)
 
     try:
-        # Prefer Docling ingestion with safe fallback
-        ingest_document_docling(user_id, path)
+        # Only PDF and DOCX supported. Use python-docx for DOCX, fallback to existing for PDF.
+        if ext == "docx":
+            ingest_docx_document(user_id, path)
+        else:
+            ingest_document_docling(user_id, path)
         # Best-effort: upload original to IBM Cloud Object Storage if configured
         cos_url = None
         if cos_enabled():
@@ -124,7 +146,7 @@ def upload_docs():
                 """,
                 (user_id, filename, duration_ms, datetime.now().isoformat(timespec="seconds"))
             )
-        return jsonify(success=False, message=str(e)), 500
+        return jsonify(success=False, message=f"Ingestion failed for {ext.upper()} file: {e}"), 500
 
 
 @app.route("/query_rag", methods=["POST"])
@@ -132,13 +154,19 @@ def query_rag():
     data = request.get_json(silent=True) or {}
     query = data.get("query", "").strip()
     user_id = data.get("user_id", "guest")
+    current_only = data.get("current_only")
+    if current_only is None:
+        current_only = (os.getenv("RAG_CURRENT_ONLY", "false").strip().lower() == "true")
 
     if not query:
         return jsonify(success=False, answer="Empty query"), 400
 
     try:
         start = time.perf_counter()
-        result = run_rag_query(query, user_id)
+        restrict_source = None
+        if current_only:
+            restrict_source = get_last_ingested_filename(user_id)
+        result = run_rag_query(query, user_id, restrict_source=restrict_source)
         duration_ms = int((time.perf_counter() - start) * 1000)
 
         with sqlite3.connect(DB_PATH) as conn:
@@ -170,6 +198,7 @@ def query_rag():
             confidence=result["confidence"],
             sources=result["sources"],
             retrieval=result.get("retrieval"),
+            restrict_source=restrict_source,
             duration_ms=duration_ms,
         )
 
@@ -252,6 +281,13 @@ def history_clear():
 # -----------------------------
 if __name__ == "__main__":
     init_db()
+    # Startup diagnostics for clarity
+    rag_mode = os.getenv("RAG_PIPELINE_MODE", "fallback")
+    emb_model = os.getenv("SENTENCE_TRANSFORMER_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    granite_model = os.getenv("GRANITE_MODEL_ID", "ibm/granite-3-8b-instruct")
+    print("🔧 RAG mode:", rag_mode)
+    print("🔧 Embedding model:", emb_model)
+    print("🔧 Granite model:", granite_model)
     print("🔥 Flask running on port 5001")
 
     # 🚨 IMPORTANT:
